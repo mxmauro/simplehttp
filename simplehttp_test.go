@@ -47,8 +47,8 @@ func TestBasic(t *testing.T) {
 	err = simplehttp.New("GET", ts.BaseUrl()+"/test").
 		WithContext(context.Background()).
 		WithHeader("X-Auth", "1234").
-		WithRetry(100*time.Millisecond, time.Second, 4).
-		Exec(func(resp *simplehttp.Response) error {
+		WithRetry(100*time.Millisecond, time.Second, 4, nil).
+		Exec(func(ctx context.Context, resp *simplehttp.Response) error {
 			if resp.StatusCode != http.StatusOK {
 				return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 			}

@@ -18,31 +18,7 @@ import (
 
 // -----------------------------------------------------------------------------
 
-var (
-	defaultMaxRedirects = 10
-
-	defaultRetryMinWait = time.Second
-	defaultRetryMaxWait = 30 * time.Second
-	defaultRetryCount   = 4
-
-	tooManyRedirectsError = errors.New("too many redirects")
-
-	nb = nullBody{}
-
-	initOnce         sync.Once
-	defaultTransport *http.Transport
-)
-
-// -----------------------------------------------------------------------------
-
-type getBodyFunc func() (io.ReadCloser, int64, error)
-
-// PreRequestCallback is a callback to call before the inner request is executed
-type PreRequestCallback func(req *http.Request) error
-
-type ExecCallback func(resp *Response) error
-
-// Request defines a retryable and augmented HTTP request
+// Request defines a retryable and augmented HTTP request.
 type Request struct {
 	transport *http.Transport
 
@@ -62,35 +38,72 @@ type Request struct {
 		minWait time.Duration
 		maxWait time.Duration
 		count   int
+
+		checkCB CheckRetryCallback
 	}
 
 	preRequestCB PreRequestCallback
 }
 
+// ExecCallback is called after a successful request is completed. Take into account a successful request
+// does NOT imply a http status 200.
+type ExecCallback func(ctx context.Context, resp *Response) error
+
+// PreRequestCallback is a callback to call before the inner request is executed.
+type PreRequestCallback func(ctx context.Context, req *http.Request) error
+
+// CheckRetryCallback is called to decide if the request must be retried. Mostly when the server returns status
+// 5xx because the body may contain useful information. On the other hand, on certain conditions like timeouts,
+// the request is retried without calling the callback.
+type CheckRetryCallback func(ctx context.Context, resp *Response) (canRetry bool, err error)
+
 // -----------------------------------------------------------------------------
 
-// New creates a new request object
+var (
+	defaultMaxRedirects = 10
+
+	defaultRetryMinWait = time.Second
+	defaultRetryMaxWait = 30 * time.Second
+	defaultRetryCount   = 4
+
+	tooManyRedirectsError = errors.New("too many redirects")
+
+	nb = nullBody{}
+
+	transportInitOnce        sync.Once
+	defaultTransport         *http.Transport
+	defaultInsecureTransport *http.Transport
+)
+
+type getBodyFunc func() (io.ReadCloser, int64, error)
+
+// -----------------------------------------------------------------------------
+
+// New creates a new request object.
 func New(method string, url string) *Request {
-	// Initialize default transport if not done yet
-	initOnce.Do(func() {
+	// Initialize default transport if not done yet.
+	transportInitOnce.Do(func() {
 		// From: https://www.loginradius.com/blog/async/tune-the-go-http-client-for-high-performance/
 		defaultTransport = http.DefaultTransport.(*http.Transport).Clone()
-		defaultTransport.MaxIdleConns = 10
+		defaultTransport.MaxIdleConns = 32
 		defaultTransport.MaxConnsPerHost = 10
 		defaultTransport.IdleConnTimeout = 60 * time.Second
 		defaultTransport.MaxIdleConnsPerHost = 10
-		defaultTransport.ResponseHeaderTimeout = 10 * time.Second
 		defaultTransport.TLSClientConfig = &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		}
+
+		defaultInsecureTransport = defaultTransport.Clone()
+		defaultInsecureTransport.TLSClientConfig.MinVersion = tls.VersionTLS10
+		defaultInsecureTransport.TLSClientConfig.InsecureSkipVerify = true
 	})
 
-	// Set default method if none is set
+	// Set default method if none is set.
 	if len(method) == 0 {
 		method = "GET"
 	}
 
-	// Create the request object
+	// Create the request object.
 	req := Request{
 		method:       method,
 		url:          url,
@@ -108,19 +121,24 @@ func New(method string, url string) *Request {
 	return &req
 }
 
-// WithTransport sets a HTTP transport
+// WithTransport sets a HTTP transport.
 func (req *Request) WithTransport(transport *http.Transport) *Request {
-	if transport == nil {
-		transport = defaultTransport
-	}
 	req.transport = transport
 
 	// Done
 	return req
 }
 
-// WithRetry establishes the number of retry attempts and the minimum and maximum wait times between them
-func (req *Request) WithRetry(min time.Duration, max time.Duration, count int) *Request {
+// WithInsecureDefaultTransport sets a default HTTPS INSECURE transport.
+func (req *Request) WithInsecureDefaultTransport() *Request {
+	req.transport = defaultInsecureTransport
+
+	// Done
+	return req
+}
+
+// WithRetry establishes the number of retry attempts and the minimum and maximum wait times between them.
+func (req *Request) WithRetry(min time.Duration, max time.Duration, count int, cb CheckRetryCallback) *Request {
 	if min <= 0 {
 		min = defaultRetryMinWait
 	}
@@ -138,12 +156,13 @@ func (req *Request) WithRetry(min time.Duration, max time.Duration, count int) *
 	req.retry.minWait = min
 	req.retry.maxWait = max
 	req.retry.count = count
+	req.retry.checkCB = cb
 
 	// Done
 	return req
 }
 
-// WithContext sets the context.Context to use during the request
+// WithContext sets the context.Context to use during the request.
 func (req *Request) WithContext(ctx context.Context) *Request {
 	req.ctx = ctx
 
@@ -151,7 +170,7 @@ func (req *Request) WithContext(ctx context.Context) *Request {
 	return req
 }
 
-// WithMaxRedirects sets the maximum number of allowed redirections. Defaults to 10
+// WithMaxRedirects sets the maximum number of allowed redirections. Defaults to 10.
 func (req *Request) WithMaxRedirects(count int) *Request {
 	if count < 0 {
 		count = defaultMaxRedirects
@@ -162,7 +181,9 @@ func (req *Request) WithMaxRedirects(count int) *Request {
 	return req
 }
 
-// WithTimeout sets the maximum allowed time to complete the request
+// WithTimeout sets the maximum allowed time to complete a request. This value sets the timeout for a single
+// request. If they are retried because, for e.g., due to server busy response, the timeout is evaluated for each
+// operation. A value of zero means no timeout. Defaults to 10 seconds.
 func (req *Request) WithTimeout(timeout time.Duration) *Request {
 	if timeout < 0 {
 		timeout = 10 * time.Second
@@ -173,7 +194,7 @@ func (req *Request) WithTimeout(timeout time.Duration) *Request {
 	return req
 }
 
-// WithHeader sets a request header key/value pair
+// WithHeader sets a request header key/value pair.
 func (req *Request) WithHeader(key string, value string) *Request {
 	req.headers.Set(key, value)
 
@@ -181,12 +202,12 @@ func (req *Request) WithHeader(key string, value string) *Request {
 	return req
 }
 
-// Headers allows direct access to the request headers
+// Headers allows direct access to the request headers.
 func (req *Request) Headers() *http.Header {
 	return &req.headers
 }
 
-// WithQuery sets an url query parameter
+// WithQuery sets an url query parameter.
 func (req *Request) WithQuery(key string, value string) *Request {
 	req.query.Set(key, value)
 
@@ -194,15 +215,15 @@ func (req *Request) WithQuery(key string, value string) *Request {
 	return req
 }
 
-// Query allows direct access to the request query parameter
+// Query allows direct access to the request query parameter.
 func (req *Request) Query() *neturl.Values {
 	return &req.query
 }
 
-// WithBody sets the request's body
+// WithBody sets the request's body.
 func (req *Request) WithBody(body io.Reader) *Request {
 	if body != nil {
-		// Set up a body reader cloning function
+		// Set up a body reader cloning function.
 		switch v := body.(type) {
 		case *bytes.Buffer:
 			buf := v.Bytes()
@@ -226,9 +247,9 @@ func (req *Request) WithBody(body io.Reader) *Request {
 			}
 
 		default:
-			// Check if the body reader implements a seeker
+			// Check if the body reader implements a seeker.
 			if seeker, hasSeeker := v.(io.Seeker); hasSeeker {
-				// Try to determine content size
+				// Try to determine content size.
 				bodySize := int64(-1)
 				if f, ok := v.(*os.File); ok {
 					fi, err := f.Stat()
@@ -252,7 +273,7 @@ func (req *Request) WithBody(body io.Reader) *Request {
 							return nil, bodySize, err2
 						}
 						// If the interface also implements a closer, let's replace it with a NopCloser just
-						// in case the underlying http.Client or transport closes it
+						// in case the underlying http.Client or transport closes it.
 						return io.NopCloser(io.LimitReader(v, bodySize)), bodySize, nil
 					}
 				} else {
@@ -264,7 +285,7 @@ func (req *Request) WithBody(body io.Reader) *Request {
 					if firstUse {
 						firstUse = false
 						// If the interface also implements a closer, let's replace it with a NopCloser just
-						// in case the underlying http.Client or transport closes it
+						// in case the underlying http.Client or transport closes it.
 						return io.NopCloser(v), -1, nil
 					}
 					return nil, -1, errors.New("unable to rewind body")
@@ -272,7 +293,7 @@ func (req *Request) WithBody(body io.Reader) *Request {
 			}
 		}
 	} else {
-		// If a body was not given, getter will return nil
+		// If a body was not given, getter will return nil.
 		req.getBody = nil
 	}
 
@@ -280,7 +301,7 @@ func (req *Request) WithBody(body io.Reader) *Request {
 	return req
 }
 
-// WithBodyBytes sets the request's body
+// WithBodyBytes sets the request's body.
 func (req *Request) WithBodyBytes(buf []byte) *Request {
 	if buf != nil {
 		req.getBody = func() (io.ReadCloser, int64, error) {
@@ -295,7 +316,7 @@ func (req *Request) WithBodyBytes(buf []byte) *Request {
 	return req
 }
 
-// WithBodyJSON sets the request's body
+// WithBodyJSON sets the request's body.
 func (req *Request) WithBodyJSON(body interface{}) *Request {
 	if body != nil {
 		payload, err := json.Marshal(body)
@@ -312,7 +333,7 @@ func (req *Request) WithBodyJSON(body interface{}) *Request {
 	return req
 }
 
-// WithPreRequestCallback specifies a callback to call before the request is executed
+// WithPreRequestCallback specifies a callback to call before the request is executed.
 func (req *Request) WithPreRequestCallback(cb PreRequestCallback) *Request {
 	req.preRequestCB = cb
 
@@ -323,13 +344,11 @@ func (req *Request) WithPreRequestCallback(cb PreRequestCallback) *Request {
 // Exec is used to execute the HTTP request. Unlike Golang's HTTP Client request, after the callback
 // is called, the response body is closed.
 func (req *Request) Exec(cb ExecCallback) error {
-	var ctxCancel context.CancelFunc
-
 	if cb == nil {
 		return errors.New("invalid callback")
 	}
 
-	// Create HTTP client handler
+	// Create HTTP client handler.
 	client := http.Client{
 		Transport: req.transport,
 		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
@@ -339,13 +358,22 @@ func (req *Request) Exec(cb ExecCallback) error {
 			return nil
 		},
 	}
+	if req.transport == nil {
+		client.Transport = defaultTransport
+	}
 
-	// Parse url
+	// Setup context.
+	ctx := req.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Parse url.
 	parsedUrl, err := neturl.Parse(req.url)
 	if err != nil {
 		return err
 	}
-	// Add query parameters
+	// Add query parameters.
 	if len(req.query) > 0 {
 		qv := parsedUrl.Query()
 		for k, v := range req.query {
@@ -353,119 +381,81 @@ func (req *Request) Exec(cb ExecCallback) error {
 		}
 		parsedUrl.RawQuery = req.query.Encode()
 	}
-	// Get the final URL
+	// Get the final URL.
 	url := parsedUrl.String()
 
-	// Setup context and add the timeout if anyone is given
-	ctx := req.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if req.timeout > 0 {
-		ctx, ctxCancel = context.WithTimeout(ctx, req.timeout)
-		defer ctxCancel()
-	}
-
-	// Main loop
+	// Main loop.
 	for attempt := 1; ; attempt++ {
-		var _req *http.Request
 		var _resp *http.Response
 
-		// Create a new request
-		_req, err = http.NewRequestWithContext(ctx, req.method, url, nil)
-		if err != nil {
-			return err
-		}
+		// Execute request.
+		_resp, err = req.execOneRequest(ctx, &client, url)
 
-		// Set the body if any
-		if req.getBody != nil {
-			_req.Body, _req.ContentLength, err = req.getBody()
-			if err != nil {
-				return err
-			}
-
-			_req.GetBody = func() (io.ReadCloser, error) {
-				bodyReader, _, err2 := req.getBody()
-				if err2 != nil {
-					return nil, err2
-				}
-				return bodyReader, nil
-			}
-		}
-
-		// Add custom headers if provided
-		if len(req.headers) > 0 {
-			_req.Header = req.headers
-		}
-
-		if req.preRequestCB != nil {
-			err = req.preRequestCB(_req)
-			if err != nil {
-				return err
-			}
-		}
-
-		// Execute request
-		_resp, err = client.Do(_req)
-
-		// Sanitization
+		// Sanitization.
 		if err == nil && _resp == nil {
 			return errors.New("unexpected nil response")
 		}
 
-		// Check if we reached the maximum amount of attempts and if we should retry the operation
-		if attempt >= req.retry.count || (!shouldRetry(_resp, err)) {
-			// Limit reached and/or no more retries
-
-			// If we don't have a response, return the error
-			if _resp == nil {
-				return err
-			}
-
-			// Build our response wrapper
-			resp := Response{
-				Status:     _resp.Status,
-				StatusCode: _resp.StatusCode,
-				Proto:      _resp.Proto,
-				ProtoMajor: _resp.ProtoMajor,
-				ProtoMinor: _resp.ProtoMinor,
-				Header:     _resp.Header,
-				Body:       nb, // Set the null body by default
-			}
-			if err == nil {
-				if _resp.Body != nil {
-					resp.Body = _resp.Body
-					resp.ContentLength = _resp.ContentLength
-				}
+		// Wrap the response.
+		resp := Response{
+			Body: nb, // Set the null body as default.
+		}
+		if _resp != nil {
+			resp.Status = _resp.Status
+			resp.StatusCode = _resp.StatusCode
+			resp.Proto = _resp.Proto
+			resp.ProtoMajor = _resp.ProtoMajor
+			resp.ProtoMinor = _resp.ProtoMinor
+			resp.Header = _resp.Header
+			if err == nil && _resp.Body != nil {
+				resp.Body = _resp.Body
+				resp.ContentLength = _resp.ContentLength
 			} else {
-				// Close the original body, if any
+				// Close the original body, if any.
 				if _resp.Body != nil {
 					_ = _resp.Body.Close()
 				}
 			}
+		}
 
-			// Call the provided callback
-			err = cb(&resp)
+		// Check if we reached the maximum amount of attempts and if we should retry the operation.
+		willRetry := true
+		if attempt >= req.retry.count {
+			// If we got an error, return it.
+			if err != nil {
+				return err
+			}
 
-			// Close request body
+			willRetry = false
+		} else {
+			willRetry, err = shouldRetry(ctx, req.retry.checkCB, &resp, err)
+
+			// If we got an error, return it.
+			if err != nil {
+				return err
+			}
+		}
+		if !willRetry {
+			// Call the provided callback with the final result.
+			err = cb(ctx, &resp)
+
+			// Close the response body.
 			resp.CloseBody()
 
-			// Done
+			// Done.
 			return err
 		}
 
-		// Close the original body, if any
-		if _resp != nil && _resp.Body != nil {
-			_ = _resp.Body.Close()
-		}
+		// Close the response body.
+		resp.CloseBody()
 
-		// Check if the context was canceled
+		// Check if the context was signalled.
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		// Calculate the time to wait until the next try
-		timeToWait := req.calculateWaitTime(attempt, _resp)
+		// Calculate the time to wait until the next try.
+		timeToWait := req.calculateWaitTime(attempt, &resp)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -474,13 +464,59 @@ func (req *Request) Exec(cb ExecCallback) error {
 	}
 }
 
-func (req *Request) calculateWaitTime(attemptNum int, _resp *http.Response) time.Duration {
-	if _resp != nil {
-		if _resp.StatusCode == http.StatusTooManyRequests || _resp.StatusCode == http.StatusServiceUnavailable {
-			toWaitTime, ok := parseRetryAfterHeader(_resp.Header.Get("Retry-After"))
-			if ok {
-				return toWaitTime
+func (req *Request) execOneRequest(ctx context.Context, client *http.Client, url string) (*http.Response, error) {
+	var ctxCancel context.CancelFunc
+
+	// Setup context with timeout if anyone is given.
+	if req.timeout > 0 {
+		ctx, ctxCancel = context.WithTimeout(ctx, req.timeout)
+		defer ctxCancel()
+	}
+
+	// Create a new request.
+	_req, err := http.NewRequestWithContext(ctx, req.method, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set the body if any.
+	if req.getBody != nil {
+		_req.Body, _req.ContentLength, err = req.getBody()
+		if err != nil {
+			return nil, err
+		}
+
+		_req.GetBody = func() (io.ReadCloser, error) {
+			bodyReader, _, err2 := req.getBody()
+			if err2 != nil {
+				return nil, err2
 			}
+			return bodyReader, nil
+		}
+	}
+
+	// Add custom headers if provided.
+	if len(req.headers) > 0 {
+		_req.Header = req.headers
+	}
+
+	// Call the pre-request callback if anyone was specified.
+	if req.preRequestCB != nil {
+		err = req.preRequestCB(ctx, _req)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Execute request
+	return client.Do(_req)
+}
+
+func (req *Request) calculateWaitTime(attemptNum int, resp *Response) time.Duration {
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+		toWaitTime, ok := parseRetryAfterHeader(resp.Header.Get("Retry-After"))
+		if ok {
+			return toWaitTime
 		}
 	}
 
