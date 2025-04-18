@@ -10,7 +10,7 @@ import (
 // -----------------------------------------------------------------------------
 
 // Response wraps the http response for quick access to most used fields and also handles automatic
-// closing of body.
+// closing of the body.
 type Response struct {
 	Status     string // e.g. "200 OK"
 	StatusCode int    // e.g. 200

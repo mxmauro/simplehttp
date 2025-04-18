@@ -65,8 +65,8 @@ func shouldRetry(ctx context.Context, checkCB CheckRetryCallback, resp *Response
 			return true, nil
 		}
 
-		// On server errors, we can try again assuming the server can eventually recover but let's
-		// call the user callback
+		// On server errors, we can try again assuming the server can eventually recover, but let's
+		// call the user callback.
 		if resp.StatusCode >= 500 && resp.StatusCode != http.StatusNotImplemented {
 			canRetry := true
 			if checkCB != nil {
@@ -81,7 +81,7 @@ func shouldRetry(ctx context.Context, checkCB CheckRetryCallback, resp *Response
 		}
 	}
 
-	// Done
+	// Done.
 	return false, err
 }
 
@@ -102,12 +102,12 @@ func parseRetryAfterHeader(value string) (time.Duration, bool) {
 	if retryAbsTime, err := time.Parse(time.RFC1123, value); err == nil {
 		toWait := retryAbsTime.UTC().Sub(time.Now().UTC())
 		if toWait < 0 {
-			// Due time
+			// Time has expired.
 			return 0, true
 		}
 		return toWait, true
 	}
 
-	// Done
+	// Done.
 	return 0, false
 }

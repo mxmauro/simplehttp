@@ -11,7 +11,7 @@ type nullBody struct {
 
 // -----------------------------------------------------------------------------
 
-func (nullBody) Read(p []byte) (n int, err error) {
+func (nullBody) Read(_ []byte) (n int, err error) {
 	return 0, io.EOF
 }
 

@@ -46,14 +46,14 @@ type Request struct {
 }
 
 // ExecCallback is called after a successful request is completed. Take into account a successful request
-// does NOT imply a http status 200.
+// does NOT imply http status 200.
 type ExecCallback func(ctx context.Context, resp *Response) error
 
 // PreRequestCallback is a callback to call before the inner request is executed.
 type PreRequestCallback func(ctx context.Context, req *http.Request) error
 
 // CheckRetryCallback is called to decide if the request must be retried. Mostly when the server returns status
-// 5xx because the body may contain useful information. On the other hand, on certain conditions like timeouts,
+// 5xx because the body may contain useful information. On the other hand, in certain conditions like timeouts,
 // the request is retried without calling the callback.
 type CheckRetryCallback func(ctx context.Context, resp *Response) (canRetry bool, err error)
 
@@ -98,7 +98,7 @@ func New(method string, url string) *Request {
 		defaultInsecureTransport.TLSClientConfig.InsecureSkipVerify = true
 	})
 
-	// Set default method if none is set.
+	// Set the default method if none is set.
 	if len(method) == 0 {
 		method = "GET"
 	}
@@ -117,15 +117,15 @@ func New(method string, url string) *Request {
 	req.retry.maxWait = defaultRetryMaxWait
 	req.retry.count = defaultRetryCount
 
-	// Done
+	// Done.
 	return &req
 }
 
-// WithTransport sets a HTTP transport.
+// WithTransport sets an HTTP transport.
 func (req *Request) WithTransport(transport *http.Transport) *Request {
 	req.transport = transport
 
-	// Done
+	// Done.
 	return req
 }
 
@@ -133,7 +133,7 @@ func (req *Request) WithTransport(transport *http.Transport) *Request {
 func (req *Request) WithInsecureDefaultTransport() *Request {
 	req.transport = defaultInsecureTransport
 
-	// Done
+	// Done.
 	return req
 }
 
@@ -158,7 +158,7 @@ func (req *Request) WithRetry(min time.Duration, max time.Duration, count int, c
 	req.retry.count = count
 	req.retry.checkCB = cb
 
-	// Done
+	// Done.
 	return req
 }
 
@@ -166,7 +166,7 @@ func (req *Request) WithRetry(min time.Duration, max time.Duration, count int, c
 func (req *Request) WithContext(ctx context.Context) *Request {
 	req.ctx = ctx
 
-	// Done
+	// Done.
 	return req
 }
 
@@ -177,7 +177,7 @@ func (req *Request) WithMaxRedirects(count int) *Request {
 	}
 	req.maxRedirects = count
 
-	// Done
+	// Done.
 	return req
 }
 
@@ -190,7 +190,7 @@ func (req *Request) WithTimeout(timeout time.Duration) *Request {
 	}
 	req.timeout = timeout
 
-	// Done
+	// Done.
 	return req
 }
 
@@ -198,11 +198,11 @@ func (req *Request) WithTimeout(timeout time.Duration) *Request {
 func (req *Request) WithHeader(key string, value string) *Request {
 	req.headers.Set(key, value)
 
-	// Done
+	// Done.
 	return req
 }
 
-// Headers allows direct access to the request headers.
+// Headers allow direct access to the request headers.
 func (req *Request) Headers() *http.Header {
 	return &req.headers
 }
@@ -211,7 +211,7 @@ func (req *Request) Headers() *http.Header {
 func (req *Request) WithQuery(key string, value string) *Request {
 	req.query.Set(key, value)
 
-	// Done
+	// Done.
 	return req
 }
 
@@ -297,7 +297,7 @@ func (req *Request) WithBody(body io.Reader) *Request {
 		req.getBody = nil
 	}
 
-	// Done
+	// Done.
 	return req
 }
 
@@ -312,7 +312,7 @@ func (req *Request) WithBodyBytes(buf []byte) *Request {
 		req.getBody = nil
 	}
 
-	// Done
+	// Done.
 	return req
 }
 
@@ -329,7 +329,7 @@ func (req *Request) WithBodyJSON(body interface{}) *Request {
 		req.setErrorBodyReader(errors.New("nil json body"))
 	}
 
-	// Done
+	// Done.
 	return req
 }
 
@@ -337,18 +337,21 @@ func (req *Request) WithBodyJSON(body interface{}) *Request {
 func (req *Request) WithPreRequestCallback(cb PreRequestCallback) *Request {
 	req.preRequestCB = cb
 
-	// Done
+	// Done.
 	return req
 }
 
 // Exec is used to execute the HTTP request. Unlike Golang's HTTP Client request, after the callback
 // is called, the response body is closed.
 func (req *Request) Exec(cb ExecCallback) error {
+	var reqCtx context.Context
+	var reqCtxCancel context.CancelFunc
+
 	if cb == nil {
 		return errors.New("invalid callback")
 	}
 
-	// Create HTTP client handler.
+	// Create an HTTP client handler.
 	client := http.Client{
 		Transport: req.transport,
 		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
@@ -388,11 +391,26 @@ func (req *Request) Exec(cb ExecCallback) error {
 	for attempt := 1; ; attempt++ {
 		var _resp *http.Response
 
+		// Set up context with timeout if anyone is given.
+		// IMPORTANT: Callback will be called with the main context, not the request context.
+		if req.timeout > 0 {
+			reqCtx, reqCtxCancel = context.WithTimeout(ctx, req.timeout)
+		} else {
+			reqCtx = ctx
+			reqCtxCancel = nil
+		}
+
 		// Execute request.
-		_resp, err = req.execOneRequest(ctx, &client, url)
+		_resp, err = req.execOneRequest(reqCtx, &client, url)
 
 		// Sanitization.
 		if err == nil && _resp == nil {
+			// Cancel the request context if any is set.
+			if reqCtxCancel != nil {
+				reqCtxCancel()
+			}
+
+			// Done.
 			return errors.New("unexpected nil response")
 		}
 
@@ -418,11 +436,17 @@ func (req *Request) Exec(cb ExecCallback) error {
 			}
 		}
 
-		// Check if we reached the maximum amount of attempts and if we should retry the operation.
+		// Check if we reached the maximum number of attempts and if we should retry the operation.
 		willRetry := true
 		if attempt >= req.retry.count {
 			// If we got an error, return it.
 			if err != nil {
+				// Cancel the request context if any is set.
+				if reqCtxCancel != nil {
+					reqCtxCancel()
+				}
+
+				// Done.
 				return err
 			}
 
@@ -432,15 +456,27 @@ func (req *Request) Exec(cb ExecCallback) error {
 
 			// If we got an error, return it.
 			if err != nil {
+				// Cancel the request context if any is set.
+				if reqCtxCancel != nil {
+					reqCtxCancel()
+				}
+
+				// Done.
 				return err
 			}
 		}
+
 		if !willRetry {
 			// Call the provided callback with the final result.
 			err = cb(ctx, &resp)
 
 			// Close the response body.
 			resp.CloseBody()
+
+			// Cancel the request context if any is set.
+			if reqCtxCancel != nil {
+				reqCtxCancel()
+			}
 
 			// Done.
 			return err
@@ -449,7 +485,12 @@ func (req *Request) Exec(cb ExecCallback) error {
 		// Close the response body.
 		resp.CloseBody()
 
-		// Check if the context was signalled.
+		// Cancel the request context if any is set.
+		if reqCtxCancel != nil {
+			reqCtxCancel()
+		}
+
+		// Check if the context was signaled.
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -465,14 +506,6 @@ func (req *Request) Exec(cb ExecCallback) error {
 }
 
 func (req *Request) execOneRequest(ctx context.Context, client *http.Client, url string) (*http.Response, error) {
-	var ctxCancel context.CancelFunc
-
-	// Setup context with timeout if anyone is given.
-	if req.timeout > 0 {
-		ctx, ctxCancel = context.WithTimeout(ctx, req.timeout)
-		defer ctxCancel()
-	}
-
 	// Create a new request.
 	_req, err := http.NewRequestWithContext(ctx, req.method, url, nil)
 	if err != nil {
@@ -520,7 +553,7 @@ func (req *Request) calculateWaitTime(attemptNum int, resp *Response) time.Durat
 		}
 	}
 
-	// Compute fraction using the exponential formula
+	// Compute a fraction using the exponential formula
 	den := math.Pow(2, float64(req.retry.count-1)) - 1
 	if den <= 0.00000000001 {
 		return req.retry.minWait
@@ -531,7 +564,7 @@ func (req *Request) calculateWaitTime(attemptNum int, resp *Response) time.Durat
 	waitRange := float64(req.retry.maxWait - req.retry.minWait)
 	scaled := float64(req.retry.minWait) + (waitRange * (num / den))
 
-	// Done
+	// Done.
 	return time.Duration(scaled)
 }
 

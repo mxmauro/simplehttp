@@ -36,7 +36,7 @@ func TestBasic(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(response)
+			_ = json.NewEncoder(w).Encode(response)
 		},
 	})
 	if err != nil {
@@ -59,6 +59,6 @@ func TestBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Done
+	// Done.
 	t.Log("Success!")
 }
