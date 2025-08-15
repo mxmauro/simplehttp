@@ -2,13 +2,10 @@ package simplehttp
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -16,32 +13,12 @@ import (
 
 func shouldRetry(ctx context.Context, checkCB CheckRetryCallback, resp *Response, err error) (bool, error) {
 	if err != nil {
-		var urlError *url.Error
-		var tlsCertError *tls.CertificateVerificationError
 		var ne net.Error
 		var netOpErr *net.OpError
 		var netDnsErr *net.DNSError
 
-		// The following errors are fatal
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			return false, err
-		}
-		if errors.Is(err, tooManyRedirectsError) {
-			return false, err
-		}
-		if errors.As(err, &urlError) {
-			errMsg := urlError.Error()
-			if strings.Contains(errMsg, "unsupported protocol scheme") {
-				return false, err
-			}
-			if strings.Contains(errMsg, "invalid header") {
-				return false, err
-			}
-			if strings.Contains(errMsg, "certificate is not trusted") {
-				return false, err
-			}
-		}
-		if errors.As(err, &tlsCertError) {
+		// The cancellation error is fatal
+		if errors.Is(err, context.Canceled) {
 			return false, err
 		}
 
@@ -50,7 +27,13 @@ func shouldRetry(ctx context.Context, checkCB CheckRetryCallback, resp *Response
 			// The error is likely recoverable so retry.
 			return true, nil
 		}
+		// Is it a timeout?
+		if errors.Is(err, context.DeadlineExceeded) {
+			// The error is likely recoverable so retry.
+			return true, nil
+		}
 
+		// Other errors are fatal.
 		return false, err
 	}
 
